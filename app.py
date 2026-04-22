@@ -1,28 +1,70 @@
+import boto3
+import logging
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify
+from datetime import datetime
 import db_handler
 import threading
 import time
+import os
 
+# Initialize Flask app
 app = Flask(__name__)
-app.secret_key = 'healthcare_super_secret_complex'
+app.secret_key = 'healthcare_secret_key'
 
-def simulated_sns_alert(patient, contact, med_name):
-    msg = f"[LOCAL ALERT] SMS SIMULATION: Alerting Caregiver at {contact} - Patient {patient} missed their dose of {med_name}!"
-    print(msg)
-    db_handler.log_alert(patient, contact, f"Missed {med_name}")
+# --- AWS SERVICES (SNS, SSM, CloudWatch) ---
+# CloudWatch Logging Setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Boto3 Clients (Will use EC2 IAM Role automatically)
+sns = boto3.client('sns', region_name='us-east-1')
+ssm = boto3.client('ssm', region_name='us-east-1')
+
+def get_sns_topic():
+    try:
+        # Get SNS Topic ARN from SSM Parameter Store (Dynamic Config)
+        parameter = ssm.get_parameter(Name='/Healthcare/SNS_TOPIC_ARN', WithDecryption=False)
+        return parameter['Parameter']['Value']
+    except Exception as e:
+        logger.error(f"Error fetching SNS ARN from SSM: {e}")
+        return None
+
+def simulated_sns_alert(patient_username, caregiver_contact, medication_name):
+    topic_arn = get_sns_topic()
+    alert_msg = f"[VITALGUARD ALERT] Patient {patient_username} missed their dose of {medication_name}! Please check on them."
+    
+    # 1. Log to CloudWatch (Service 1)
+    logger.info(f"SNS ALERT TRIGGERED: {alert_msg}")
+    
+    # 2. Publish to SNS (Service 2)
+    if topic_arn:
+        try:
+            sns.publish(
+                TopicArn=topic_arn,
+                Message=alert_msg,
+                Subject=f"Missed Dose Alert: {patient_username}"
+            )
+            logger.info("Successfully published to SNS.")
+        except Exception as e:
+            logger.error(f"Failed to publish to SNS: {e}")
+    else:
+        logger.warning("SNS Topic ARN not found in SSM. Simulated alert only.")
+
+# --- BACKGROUND MONITORING ---
 def background_checker():
-    # Loop to periodically check for missed doses
+    logger.info("Background Adherence Checker Started.")
     while True:
-        missed = db_handler.check_missed_doses()
-        for m in missed:
-            simulated_sns_alert(m['patient'], m['caregiver_contact'], m['medication_name'])
+        try:
+            missed = db_handler.check_missed_doses()
+            for m in missed:
+                simulated_sns_alert(m['patient'], m['caregiver_contact'], m['medication_name'])
+                # Log the alert event in history
+                db_handler.log_alert(m['patient'], m['caregiver_contact'], f"System detected missed dose: {m['medication_name']}")
+        except Exception as e:
+            logger.error(f"Error in background checker: {e}")
         time.sleep(60)
 
-# Start background thread
-thread = threading.Thread(target=background_checker, daemon=True)
-thread.start()
-
+# --- ROUTES ---
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -30,18 +72,23 @@ def index():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
+        # Login using email as the Partition Key for DynamoDB
+        email = request.form['email']
         password = request.form['password']
-        user = db_handler.authenticate_user(username, password)
-        if user:
+        
+        user = db_handler.get_user_by_email(email)
+        if user and user['password'] == password:
             session['username'] = user['username']
+            session['email'] = user['email']
             session['role'] = user['role']
+            session['name'] = user['name']
+            
             if user['role'] == 'patient':
                 return redirect(url_for('patient_dashboard'))
             else:
                 return redirect(url_for('caregiver_dashboard'))
         else:
-            return render_template('login.html', error="Invalid Credentials")
+            return render_template('login.html', error="Invalid Email or Password")
     return render_template('login.html')
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -49,12 +96,12 @@ def register():
     if request.method == 'POST':
         user_data = dict(request.form)
         
-        # Automatically fetch caregiver contact to prevent mismatch
+        # Automatically fetch caregiver contact for patients
         if user_data.get('role') == 'patient' and user_data.get('assigned_caregiver'):
             cg = db_handler.get_user(user_data['assigned_caregiver'])
             if cg:
                 user_data['caregiver_contact'] = cg.get('phone_number', 'N/A')
-                
+        
         success, message = db_handler.create_user(user_data)
         if success:
             return redirect(url_for('login'))
@@ -68,79 +115,51 @@ def register():
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect(url_for('login'))
+    return redirect(url_for('index'))
 
+# --- PATIENT DASHBOARD ---
 @app.route('/patient_dashboard')
 def patient_dashboard():
     if 'username' not in session or session['role'] != 'patient':
         return redirect(url_for('login'))
     
-    patient = db_handler.get_user(session['username'])
     meds = db_handler.get_patient_medications(session['username'])
-    recent_doses = db_handler.get_patient_dose_logs(session['username'])
+    logs = db_handler.get_patient_dose_logs(session['username'])
     vitals = db_handler.get_patient_vitals(session['username'])
     
-    # Prepare data for Chart.js
-    chart_data = {
-        "labels": [v['timestamp'].strftime('%m/%d %H:%M') for v in reversed(vitals)],
-        "hr": [v.get('hr', 0) for v in reversed(vitals)],
-        "glucose": [v.get('glucose', 0) for v in reversed(vitals)],
-        "bp_sys": [],
-        "bp_dia": []
-    }
+    # Get user details for profile section
+    user_details = db_handler.get_user_by_email(session['email'])
     
-    for v in reversed(vitals):
-        bp = v.get('bp', '')
-        if '/' in bp:
-            try:
-                s, d = map(int, bp.split('/'))
-                chart_data["bp_sys"].append(s)
-                chart_data["bp_dia"].append(d)
-            except:
-                chart_data["bp_sys"].append(0)
-                chart_data["bp_dia"].append(0)
-        else:
-            chart_data["bp_sys"].append(0)
-            chart_data["bp_dia"].append(0)
-
     return render_template('patient_dashboard.html', 
-                           patient=patient, 
+                           user=user_details,
                            meds=meds, 
-                           recent_doses=recent_doses,
-                           vitals=vitals,
-                           chart_data=chart_data)
+                           logs=logs,
+                           vitals=vitals)
+
+@app.route('/api/log_specific_dose', methods=['POST'])
+def log_specific_dose():
+    data = request.json
+    med_name = data.get('medication_name')
+    status = data.get('status')
+    
+    if db_handler.log_dose(session['username'], med_name, "Manual", status):
+        return jsonify({"success": True})
+    return jsonify({"success": False})
 
 @app.route('/patient_vitals')
 def patient_vitals():
-    if 'username' not in session or session['role'] != 'patient':
+    if 'username' not in session:
         return redirect(url_for('login'))
-    
-    meds = db_handler.get_patient_medications(session['username'])
-    return render_template('patient_vitals.html', meds=meds)
-
-@app.route('/api/log_specific_dose', methods=['POST'])
-def api_log_specific_dose():
-    if 'username' not in session or session['role'] != 'patient':
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    data = request.json
-    med_name = data.get('medication_name')
-    status = data.get('status', 'Taken')
-    
-    if med_name:
-        db_handler.log_dose(session['username'], med_name, "Scheduled", status)
-        return jsonify({"success": True})
-    return jsonify({"success": False}), 400
+    return render_template('patient_vitals.html')
 
 @app.route('/api/log_vitals', methods=['POST'])
 def api_log_vitals():
-    if 'username' not in session or session['role'] != 'patient':
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-    
-    data = request.json
-    db_handler.log_vitals(session['username'], data)
-    return jsonify({"success": True})
+    vitals_data = request.json
+    if db_handler.log_vitals(session['username'], vitals_data):
+        return jsonify({"success": True})
+    return jsonify({"success": False})
 
+# --- CAREGIVER DASHBOARD ---
 @app.route('/caregiver_dashboard')
 def caregiver_dashboard():
     if 'username' not in session or session['role'] != 'caregiver':
@@ -164,32 +183,26 @@ def caregiver_dashboard():
 def assign_meds():
     if 'username' not in session or session['role'] != 'caregiver':
         return redirect(url_for('login'))
-
+        
     if request.method == 'POST':
         med_data = {
-            "patient_username": request.form['patient_username'],
-            "drug_name": request.form['drug_name'],
-            "dosage": request.form['dosage'],
-            "frequency": request.form['frequency'],
-            "instructions": request.form['instructions']
+            'patient_username': request.form['patient_username'],
+            'drug_name': request.form['drug_name'],
+            'dosage': request.form['dosage'],
+            'timing': request.form['timing'],
+            'start_date': request.form['start_date'],
+            'assigned_by': session['username'],
+            'created_at': datetime.now().isoformat()
         }
         db_handler.add_medication(med_data)
         return redirect(url_for('caregiver_dashboard'))
-
+        
     patients = db_handler.get_patients_for_caregiver(session['username'])
-    all_doses = db_handler.get_all_dose_logs()
-    return render_template('assign_meds.html', patients=patients, all_doses=all_doses)
+    return render_template('assign_meds.html', patients=patients)
 
 if __name__ == '__main__':
-    # Initialize some test users via dict to support new schema if they don't exist
-    db_handler.create_user({
-        'username':'john', 'password':'pass123', 'role':'patient', 
-        'name':'John Doe', 'age': 45,
-        'blood_group': 'O+', 'caregiver_contact': '555-0000'
-    })
-    db_handler.create_user({
-        'username':'mary', 'password':'pass123', 'role':'caregiver',
-        'name': 'Mary Smith', 'phone_number': '9123456789'
-    })
+    # Start background thread
+    threading.Thread(target=background_checker, daemon=True).start()
     
-    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)
+    # Run Flask on Port 5000 (EC2 Default)
+    app.run(debug=False, host='0.0.0.0', port=5000)
